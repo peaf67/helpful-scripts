@@ -31,16 +31,80 @@ function Get-MailboxDelegatesReport {
     param (
     )
 
-    # Connect to Exchange Online if not already connected
+    # Connect to Exchange Online if not already connected. Stop the script if
+    # the module is missing or authentication does not establish a connection.
     if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
-        Write-Error "ExchangeOnlineManagement module is not installed."
-        return
+        throw "ExchangeOnlineManagement module is not installed."
     }
     if (-not (Get-ConnectionInformation)) {
         Connect-ExchangeOnline -ShowBanner:$false
     }
+    if (-not (Get-ConnectionInformation)) {
+        throw "Exchange Online authentication failed."
+    }
+
+    # Fetch each user's Entra ID sign-in state (accountEnabled) via Microsoft
+    # Graph. Graph runs in a separate console process (a child of the current
+    # PowerShell host) so its MSAL assemblies load independently, avoiding an
+    # assembly-version conflict with ExchangeOnlineManagement. The child uses
+    # its own window so WAM has a parent window handle for interactive auth.
+    # Results are written to a temp JSON file; the exit code signals success.
+    # The child is launched before the mailbox fetch so the two run concurrently.
+    $childExe = if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh.exe' } else { 'powershell.exe' }
+    $childPath = Join-Path $PSHome $childExe
+    $graphResultFile = [System.IO.Path]::GetTempFileName()
+    $graphScriptFile = [System.IO.Path]::GetTempFileName() + '.ps1'
+    $graphScript = @"
+`$ErrorActionPreference = 'Stop'
+try {
+    if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Users)) {
+        Write-Error 'Microsoft.Graph.Users module is not installed.'
+        exit 2
+    }
+    Connect-MgGraph -Scopes 'User.Read.All' | Out-Null
+    if (-not (Get-MgContext)) {
+        Write-Error 'Microsoft Graph authentication failed.'
+        exit 3
+    }
+    Get-MgUser -All -Property UserPrincipalName, AccountEnabled |
+        Select-Object UserPrincipalName, AccountEnabled |
+        ConvertTo-Json -Depth 2 |
+        Set-Content -Path '$graphResultFile' -Encoding UTF8
+    exit 0
+}
+catch {
+    Write-Error `$_.Exception.Message
+    exit 4
+}
+"@
+    Set-Content -Path $graphScriptFile -Value $graphScript -Encoding UTF8
+    $graphProc = Start-Process -FilePath $childPath -ArgumentList '-NoProfile','-File',$graphScriptFile -PassThru -WindowStyle Normal
 
     $mailboxes = Get-ExoMailbox -ResultSize Unlimited -Properties GrantSendOnBehalfTo
+
+    # Wait for the Graph child to finish (10-minute timeout).
+    if (-not $graphProc.WaitForExit(600000)) {
+        $graphProc | Stop-Process -Force -ErrorAction SilentlyContinue
+        Remove-Item $graphScriptFile, $graphResultFile -Force -ErrorAction SilentlyContinue
+        throw "Microsoft Graph lookup timed out."
+    }
+    Remove-Item $graphScriptFile -Force -ErrorAction SilentlyContinue
+
+    if ($graphProc.ExitCode -ne 0 -or -not (Test-Path $graphResultFile)) {
+        Remove-Item $graphResultFile -Force -ErrorAction SilentlyContinue
+        throw "Microsoft Graph authentication or lookup failed (exit code $($graphProc.ExitCode))."
+    }
+
+    # Build a UPN -> accountEnabled hashtable from the child's JSON output.
+    # Force-array the JSON parse so a single-user tenant still iterates.
+    $signInByUpn = @{}
+    $json = Get-Content $graphResultFile -Raw
+    Remove-Item $graphResultFile -Force -ErrorAction SilentlyContinue
+    if ($json) {
+        foreach ($u in @($json | ConvertFrom-Json)) {
+            $signInByUpn[$u.UserPrincipalName] = $u.AccountEnabled
+        }
+    }
 
     foreach ($mbx in $mailboxes) {
         # Get Full Access Delegates
@@ -68,11 +132,12 @@ function Get-MailboxDelegatesReport {
             }
         }
 
-        # Determine whether the account's sign-in is blocked
-        $user = Get-User -Identity $mbx.Identity -ErrorAction SilentlyContinue
-        if ($null -ne $user) {
-            $signInBlocked = [bool]$user.BlockedCredentials
-            $signInStatus = if ($signInBlocked) { 'Blocked' } else { 'Allowed' }
+        # Determine sign-in status from the Entra ID accountEnabled value
+        # retrieved via Graph. Exchange's BlockedCredentials property does not
+        # reflect actual M365 sign-in state.
+        if ($signInByUpn.ContainsKey($mbx.UserPrincipalName)) {
+            $enabled = $signInByUpn[$mbx.UserPrincipalName]
+            $signInStatus = if ($enabled) { 'Allowed' } else { 'Blocked' }
         }
         else {
             $signInStatus = 'Unknown'
@@ -91,5 +156,11 @@ function Get-MailboxDelegatesReport {
 
 $reportPath = Join-Path -Path $PSScriptRoot -ChildPath "delegates.csv"
 Write-Host "Generating delegation report. This may take a few minutes..."
-Get-MailboxDelegatesReport | Export-Csv -Path $reportPath -NoTypeInformation
+try {
+    Get-MailboxDelegatesReport | Export-Csv -Path $reportPath -NoTypeInformation
+}
+catch {
+    Write-Error "Report generation stopped: $($_.Exception.Message)"
+    exit 1
+}
 Write-Host "Delegation report exported to: $reportPath"
