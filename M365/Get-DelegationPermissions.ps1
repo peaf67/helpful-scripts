@@ -9,6 +9,14 @@
 
     .Notes
     Requires ExchangeOnlineManagement v3 module and appropriate permissions.
+    Requires Microsoft.Graph.Users module and User.Read.All permission for
+    sign-in status lookups via Microsoft Graph.
+
+    The Graph lookup runs in a separate console process to avoid an MSAL
+    assembly conflict with ExchangeOnlineManagement. A second console window
+    appears briefly during the run for interactive Graph authentication.
+
+    Tested with PowerShell 7. YMMV with PowerShell 5.
 #>
 
 <#
