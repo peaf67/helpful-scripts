@@ -154,6 +154,7 @@ catch {
         [PSCustomObject]@{
             DisplayName         = $mbx.DisplayName
             Mailbox             = $mbx.PrimarySmtpAddress
+            MailboxType         = $mbx.RecipientTypeDetails
             SignInStatus        = $signInStatus
             FullAccessDelegates = ($fullAccess -join '; ')
             SendAsDelegates     = ($sendAs -join '; ')
